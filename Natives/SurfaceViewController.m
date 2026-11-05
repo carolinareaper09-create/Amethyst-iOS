@@ -1,5 +1,6 @@
 #import <AVFoundation/AVFoundation.h>
 #import <GameController/GameController.h>
+#import <QuartzCore/QuartzCore.h>
 #import <objc/runtime.h>
 
 #import "authenticator/BaseAuthenticator.h"
@@ -30,6 +31,12 @@ int memorystatus_control(uint32_t command, int32_t pid, uint32_t flags, void *bu
 #define MEMORYSTATUS_CMD_SET_JETSAM_TASK_LIMIT        6
 
 static int currentHotbarSlot = -1;
+// iPhone mouse support: last time raw GCMouse motion arrived, and pointer-hover
+// state used as a fallback camera source when no raw motion arrives.
+static CFTimeInterval lastRawMouseMotionTime;
+static CGPoint lastHoverLookPoint;
+static BOOL hasHoverLookPoint;
+static int mouseDebugCount, hoverDebugCount;
 static GameSurfaceView* pojavWindow;
 
 @interface SurfaceViewController ()<UITextFieldDelegate, UIGestureRecognizerDelegate> {
@@ -224,8 +231,9 @@ static GameSurfaceView* pojavWindow;
             self.ctrlView.hidden = NO;
         }
     }];
-    if (GCMouse.current != nil) {
-        [self registerMouseCallbacks:GCMouse.current];
+    NSLog(@"Input: %lu mice connected at start", (unsigned long)GCMouse.mice.count);
+    for (GCMouse *connectedMouse in GCMouse.mice) {
+        [self registerMouseCallbacks:connectedMouse];
     }
     
 
@@ -658,9 +666,15 @@ static GameSurfaceView* pojavWindow;
         // iPhone never grants pointer lock (pointerLockState is nil there), so
         // requiring it threw away every mouse movement on iPhone. While the game
         // has grabbed the cursor, use the raw deltas for camera look anyway.
-        if (!self.view.window.windowScene.pointerLockState.locked && !isGrabbing) {
+        BOOL pointerLocked = self.view.window.windowScene.pointerLockState.locked;
+        if (mouseDebugCount < 5 || mouseDebugCount % 500 == 0) {
+            NSLog(@"Input: raw mouse motion %.2f,%.2f locked=%d grabbing=%d", deltaX, deltaY, (int)pointerLocked, (int)isGrabbing);
+        }
+        mouseDebugCount++;
+        if (!pointerLocked && !isGrabbing) {
             return;
         }
+        lastRawMouseMotionTime = CACurrentMediaTime();
         [self sendTouchPoint:CGPointMake(deltaX, -deltaY) withEvent:ACTION_MOVE_MOTION];
     };
 
@@ -739,7 +753,23 @@ static GameSurfaceView* pojavWindow;
 }
 
 - (void)surfaceOnHover:(UIGestureRecognizer *)sender {
-    if (isGrabbing) return;
+    if (isGrabbing) {
+        // Fallback for iPhone: if no raw mouse motion is arriving, turn the
+        // AssistiveTouch pointer's movement into camera look.
+        CGPoint lookPoint = [sender locationInView:self.rootView];
+        BOOL rawMotionActive = CACurrentMediaTime() - lastRawMouseMotionTime < 0.5;
+        if (sender.state == UIGestureRecognizerStateChanged && hasHoverLookPoint && !rawMotionActive
+            && !self.view.window.windowScene.pointerLockState.locked) {
+            if (hoverDebugCount < 5 || hoverDebugCount % 500 == 0) {
+                NSLog(@"Input: hover look %.2f,%.2f", lookPoint.x - lastHoverLookPoint.x, lookPoint.y - lastHoverLookPoint.y);
+            }
+            hoverDebugCount++;
+            [self sendTouchPoint:CGPointMake(lookPoint.x - lastHoverLookPoint.x, lookPoint.y - lastHoverLookPoint.y) withEvent:ACTION_MOVE_MOTION];
+        }
+        hasHoverLookPoint = sender.state == UIGestureRecognizerStateBegan || sender.state == UIGestureRecognizerStateChanged;
+        lastHoverLookPoint = lookPoint;
+        return;
+    }
     
     CGPoint point = [sender locationInView:self.rootView];
     // NSLog(@"Mouse move!!");
