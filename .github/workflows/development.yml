@@ -19,26 +19,28 @@ jobs:
           - platform: 2
             platform_name: ios
     
-    runs-on: J316sAP
+    # GitHub-hosted Mac (free for public repos) instead of the project's own build machine
+    runs-on: macos-26
     steps:
-      - name: Remove work folders
-        run: |
-          echo "before"
-          ls -lah ./
-          rm -rf ./* || true
-          rm -rf ./.??* || true
-          echo "after"
-          ls -lah ./
-          
       - name: Checkout repository
         uses: actions/checkout@main
 
       - name: Checkout repository submodules
         run: git submodule update --init --recursive
 
+      - name: Install build dependencies
+        run: |
+          brew install ldid make cmake
+          # The Makefile requires a JDK 8 javac. Zulu 8 has a native arm64 macOS build.
+          curl -sL -o /tmp/zulu8.tar.gz \
+            https://cdn.azul.com/zulu/bin/zulu8.96.0.205-ca-jdk8.0.504-macosx_aarch64.tar.gz
+          sudo mkdir -p /Library/Java/JavaVirtualMachines
+          sudo tar xzf /tmp/zulu8.tar.gz -C /Library/Java/JavaVirtualMachines/
+          "$(/usr/libexec/java_home -v 1.8)/bin/javac" -version
+
       - name: Get gl4es latest commit hash
         id: gl4es-sha
-        run: echo "::set-output name=sha::$(echo $(git ls-remote https://github.com/PojavLauncherTeam/gl4es-114-extra refs/heads/master | grep -io '^\S*'))"
+        run: echo "sha=$(git ls-remote https://github.com/PojavLauncherTeam/gl4es-114-extra refs/heads/master | grep -io '^\S*')" >> "$GITHUB_OUTPUT"
         shell: bash
 
       - name: Cache gl4es
@@ -83,6 +85,9 @@ jobs:
         run: |
           export PATH=/opt/homebrew/bin:$PATH
           export SLIMMED=1
+          # Compile the Java part one file at a time first, so parallel javac runs
+          # can't write half-finished .class files on the hosted runner.
+          gmake java JOBS=1 PLATFORM=${{ matrix.platform }}
           if [ "${{ matrix.platform_name }}" == "ios" ]; then
             # Build ipa and tipa for iOS
             gmake -j$(sysctl -n hw.ncpu) dsym package PLATFORM=${{ matrix.platform }}
