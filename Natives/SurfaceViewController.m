@@ -37,12 +37,21 @@ static CFTimeInterval lastRawMouseMotionTime;
 static CGPoint lastHoverLookPoint;
 static BOOL hasHoverLookPoint;
 static int mouseDebugCount, hoverDebugCount;
+// iPhone mouse clicks: GameController may never report the buttons, so fall
+// back to UIKit pointer clicks until it does.
+static CFTimeInterval lastGCMouseButtonTime;
+static int pointerClickButton = -1;
+static BOOL pointerClickPending, pointerReleaseQueued;
+static int buttonDebugCount, touchDebugCount;
 static GameSurfaceView* pojavWindow;
 
 @interface SurfaceViewController ()<UITextFieldDelegate, UIGestureRecognizerDelegate> {
 }
 
 @property(nonatomic) NSDictionary* metadata;
+
++ (void)noteGCMouseButton:(int)glfwButton pressed:(BOOL)pressed;
+- (void)sendPointerClickFromTouch:(UITouch *)touch event:(UIEvent *)event down:(BOOL)down;
 
 @property(nonatomic) TrackedTextField *inputTextField;
 @property(nonatomic) NSMutableArray* swipeableButtons;
@@ -226,6 +235,14 @@ static GameSurfaceView* pojavWindow;
         mouse.mouseInput.middleButton.pressedChangedHandler = nil;
         mouse.mouseInput.rightButton.pressedChangedHandler = nil;
         [mouse.mouseInput.auxiliaryButtons makeObjectsPerformSelector:@selector(setPressedChangedHandler:) withObject:nil];
+        NSLog(@"Input: disconnected mouse was %@, %lu mice remain", mouse, (unsigned long)GCMouse.mice.count);
+        // iOS re-creates mouse devices on iPhone (AssistiveTouch), so make sure
+        // every mouse still connected keeps its handlers.
+        for (GCMouse *remainingMouse in GCMouse.mice) {
+            if (remainingMouse != mouse) {
+                [self registerMouseCallbacks:remainingMouse];
+            }
+        }
         [self setNeedsUpdateOfPrefersPointerLocked];
         if (getPrefBool(@"controll.hardware_hide")) {
             self.ctrlView.hidden = NO;
@@ -427,6 +444,9 @@ static GameSurfaceView* pojavWindow;
     }
     self.scrollPanGesture.enabled = !isGrabbing;
     self.mousePointerView.hidden = isGrabbing || !virtualMouseEnabled;
+    for (GCMouse *connectedMouse in GCMouse.mice) {
+        [self registerMouseCallbacks:connectedMouse];
+    }
     [self setNeedsUpdateOfPrefersPointerLocked];
 
     // Update buttons visibility
@@ -679,12 +699,15 @@ static GameSurfaceView* pojavWindow;
     };
 
     mouse.mouseInput.leftButton.pressedChangedHandler = ^(GCControllerButtonInput * _Nonnull button, float value, BOOL pressed) {
+        [SurfaceViewController noteGCMouseButton:GLFW_MOUSE_BUTTON_LEFT pressed:pressed];
         CallbackBridge_nativeSendMouseButton(GLFW_MOUSE_BUTTON_LEFT, pressed, 0);
     };
     mouse.mouseInput.middleButton.pressedChangedHandler = ^(GCControllerButtonInput * _Nonnull button, float value, BOOL pressed) {
+        [SurfaceViewController noteGCMouseButton:GLFW_MOUSE_BUTTON_MIDDLE pressed:pressed];
         CallbackBridge_nativeSendMouseButton(GLFW_MOUSE_BUTTON_MIDDLE, pressed, 0);
     };
     mouse.mouseInput.rightButton.pressedChangedHandler = ^(GCControllerButtonInput * _Nonnull button, float value, BOOL pressed) {
+        [SurfaceViewController noteGCMouseButton:GLFW_MOUSE_BUTTON_RIGHT pressed:pressed];
         CallbackBridge_nativeSendMouseButton(GLFW_MOUSE_BUTTON_RIGHT, pressed, 0);
     };
     // GLFW can handle up to 8 mouse buttons, the first 3 buttons are reserved for left,middle,right
@@ -1008,6 +1031,69 @@ static GameSurfaceView* pojavWindow;
 
 #pragma mark - Input: On-screen touch events
 
++ (void)noteGCMouseButton:(int)glfwButton pressed:(BOOL)pressed {
+    if (buttonDebugCount < 10) {
+        NSLog(@"Input: GCMouse button %d pressed=%d grabbing=%d", glfwButton, (int)pressed, (int)isGrabbing);
+        buttonDebugCount++;
+    }
+    lastGCMouseButtonTime = CACurrentMediaTime();
+}
+
+// Clicks from a mouse on iPhone (AssistiveTouch) can arrive only as UIKit
+// pointer touches. Turn them into mouse button presses unless GameController
+// is already delivering the buttons.
+- (void)sendPointerClickFromTouch:(UITouch *)touch event:(UIEvent *)event down:(BOOL)down {
+    if (down) {
+        UIEventButtonMask mask = event.buttonMask;
+        int button = GLFW_MOUSE_BUTTON_LEFT;
+        if (mask & UIEventButtonMaskSecondary) {
+            button = GLFW_MOUSE_BUTTON_RIGHT;
+        } else if (mask & UIEventButtonMaskForButtonNumber(3)) {
+            button = GLFW_MOUSE_BUTTON_MIDDLE;
+        }
+        if (!isGrabbing && !virtualMouseEnabled) {
+            [self sendTouchPoint:[touch locationInView:self.rootView] withEvent:ACTION_DOWN];
+        }
+        if (pointerClickButton != -1) {
+            CallbackBridge_nativeSendMouseButton(pointerClickButton, 0, 0);
+            pointerClickButton = -1;
+        }
+        // GameController and UIKit can both report the same click within a few
+        // milliseconds of each other. Wait briefly and only send this click if
+        // GameController didn't.
+        CFTimeInterval touchTime = CACurrentMediaTime();
+        pointerClickPending = YES;
+        pointerReleaseQueued = NO;
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 80 * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{
+            pointerClickPending = NO;
+            if (lastGCMouseButtonTime > touchTime - 0.1) {
+                pointerReleaseQueued = NO;
+                return;
+            }
+            if (touchDebugCount < 20) {
+                NSLog(@"Input: pointer click fallback button %d", button);
+                touchDebugCount++;
+            }
+            pointerClickButton = button;
+            CallbackBridge_nativeSendMouseButton(button, 1, 0);
+            if (pointerReleaseQueued) {
+                pointerReleaseQueued = NO;
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 33 * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{
+                    if (pointerClickButton == button) {
+                        CallbackBridge_nativeSendMouseButton(button, 0, 0);
+                        pointerClickButton = -1;
+                    }
+                });
+            }
+        });
+    } else if (pointerClickPending) {
+        pointerReleaseQueued = YES;
+    } else if (pointerClickButton != -1) {
+        CallbackBridge_nativeSendMouseButton(pointerClickButton, 0, 0);
+        pointerClickButton = -1;
+    }
+}
+
 int touchesMovedCount;
 // Equals to Android ACTION_DOWN
 - (void)touchesBegan:(NSSet *)touches withEvent:(UIEvent *)event
@@ -1015,8 +1101,13 @@ int touchesMovedCount;
     [super touchesBegan:touches withEvent:event];
     int i = 0;
     for (UITouch *touch in touches) {
+        if (touchDebugCount < 10) {
+            NSLog(@"Input: touch began type=%ld buttons=%ld grabbing=%d mice=%lu", (long)touch.type, (long)event.buttonMask, (int)isGrabbing, (unsigned long)GCMouse.mice.count);
+            touchDebugCount++;
+        }
         if (touch.type == UITouchTypeIndirectPointer) {
-            continue; // handle this in a different place
+            [self sendPointerClickFromTouch:touch event:event down:YES];
+            continue;
         }
         CGPoint locationInView = [touch locationInView:self.rootView];
         CGFloat screenScale = [[UIScreen mainScreen] scale];
@@ -1060,7 +1151,8 @@ int touchesMovedCount;
 {
     for (UITouch *touch in touches) {
         if (touch.type == UITouchTypeIndirectPointer) {
-            continue; // handle this in a different place
+            [self sendPointerClickFromTouch:touch event:event down:NO];
+            continue;
         }
         [self sendTouchEvent:touch withUIEvent:event withEvent:ACTION_UP];
     }
