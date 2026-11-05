@@ -655,7 +655,10 @@ static GameSurfaceView* pojavWindow;
 - (void)registerMouseCallbacks:(GCMouse *)mouse {
     NSLog(@"Input: Got mouse %@", mouse);
     mouse.mouseInput.mouseMovedHandler = ^(GCMouseInput * _Nonnull mouse, float deltaX, float deltaY) {
-        if (!self.view.window.windowScene.pointerLockState.locked) {
+        // iPhone never grants pointer lock (pointerLockState is nil there), so
+        // requiring it threw away every mouse movement on iPhone. While the game
+        // has grabbed the cursor, use the raw deltas for camera look anyway.
+        if (!self.view.window.windowScene.pointerLockState.locked && !isGrabbing) {
             return;
         }
         [self sendTouchPoint:CGPointMake(deltaX, -deltaY) withEvent:ACTION_MOVE_MOTION];
